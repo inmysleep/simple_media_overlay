@@ -22,9 +22,16 @@ rodio = { version = "0.20", default-features = false, features = ["symphonia-all
 [target.'cfg(target_os = "windows")'.dependencies]
 i-slint-backend-winit = "1.8"
 winit = "0.30"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [build-dependencies]
 slint-build = "1.8"
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+winres = "0.1"
 
 [features]
 default = ["video"]

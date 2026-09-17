@@ -2,6 +2,7 @@ import { Button, LineEdit } from "std-widgets.slint";
 
 export component OverlayWindow inherits Window {
     title: "Simple Media Overlay";
+    icon: @image-url("../assets/icon.png");
     no-frame: true;
     always-on-top: true;
     background: transparent;
@@ -13,7 +14,6 @@ export component OverlayWindow inherits Window {
 
     in-out property <image> current-image;
     in-out property <bool> has-image: false;
-    // Shown on the backdrop when there is sound but no picture (audio-only files).
     in-out property <string> caption: "";
 
     callback close-requested();
@@ -138,24 +138,20 @@ export component OverlayWindow inherits Window {
 
 export component HomeWindow inherits Window {
     title: "Simple Media Overlay";
+    icon: @image-url("../assets/icon.png");
     preferred-width: 300px;
     preferred-height: 210px;
     min-width: 260px;
     min-height: 190px;
 
-    in-out property <image> icon-image;
-    icon: icon-image;
-
     in-out property <string> width-text: "400";
     in-out property <string> height-text: "300";
     in-out property <string> status-text: "Nothing loaded";
 
-    // Audio state, driven from Rust.
     in-out property <bool> has-audio: false;
     in-out property <bool> muted: false;
 
     callback open-file();
-    callback pick-icon();
     callback set-size(string, string);
     callback toggle-mute();
     callback hide-to-tray();
@@ -172,16 +168,9 @@ export component HomeWindow inherits Window {
             wrap: word-wrap;
         }
 
-        HorizontalLayout {
-            spacing: 6px;
-            Button {
-                text: "Open Media";
-                clicked => { root.open-file(); }
-            }
-            Button {
-                text: "Icon";
-                clicked => { root.pick-icon(); }
-            }
+        Button {
+            text: "Open Media";
+            clicked => { root.open-file(); }
         }
 
         HorizontalLayout {

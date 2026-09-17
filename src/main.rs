@@ -10,7 +10,7 @@ use std::time::Duration;
 use image::codecs::gif::GifDecoder;
 use image::AnimationDecoder;
 use serde::{Deserialize, Serialize};
-use slint::{Image as SlintImage, Rgba8Pixel, SharedPixelBuffer, Timer, TimerMode};
+use slint::{ComponentHandle, Image as SlintImage, Rgba8Pixel, SharedPixelBuffer, Timer, TimerMode};
 const APP_NAME: &str = "Simple Media Overlay";
 const CONFIG_DIR: &str = "simple-media-overlay";
 
@@ -24,7 +24,6 @@ enum Playback {
 #[derive(Serialize, Deserialize, Default, Clone)]
 struct Settings {
     last_file: Option<PathBuf>,
-    icon_file: Option<PathBuf>,
     overlay_x: Option<i32>,
     overlay_y: Option<i32>,
     overlay_w: Option<u32>,
@@ -69,12 +68,6 @@ fn main() {
 
     home.set_muted(settings.borrow().muted);
     home.set_has_audio(false);
-
-    if let Some(icon_path) = settings.borrow().icon_file.clone() {
-        if let Ok(img) = image::open(&icon_path) {
-            home.set_icon_image(to_slint_image(&img.to_rgba8()));
-        }
-    }
 
     {
         let s = settings.borrow();
@@ -126,29 +119,6 @@ fn main() {
                 .pick_file()
             {
                 open_path(&path, &overlay_weak, &home_weak, &playback, &timer, &settings, &audio);
-            }
-        });
-    }
-
-    {
-        let home_weak = home.as_weak();
-        let settings = settings.clone();
-
-        home.on_pick_icon(move || {
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("Icon image", &["png", "ico", "jpg", "jpeg", "bmp"])
-                .pick_file()
-            {
-                if let Ok(img) = image::open(&path) {
-                    let icon_image = to_slint_image(&img.to_rgba8());
-                    if let Some(home) = home_weak.upgrade() {
-                        home.set_icon_image(icon_image);
-                    }
-                    settings.borrow_mut().icon_file = Some(path);
-                    settings.borrow().save();
-                } else {
-                    eprintln!("Could not load icon {path:?}");
-                }
             }
         });
     }
@@ -229,10 +199,11 @@ fn main() {
             let window = overlay.window();
             let scale = window.scale_factor();
             let cur = window.position();
-            window.set_position(slint::PhysicalPosition::new(
-                cur.x + (dx * scale) as i32,
-                cur.y + (dy * scale) as i32,
-            ));
+            let size = window.size();
+            let raw_x = cur.x + (dx * scale) as i32;
+            let raw_y = cur.y + (dy * scale) as i32;
+            let (x, y) = screen_snap::snap(&overlay, raw_x, raw_y, size.width, size.height, scale);
+            window.set_position(slint::PhysicalPosition::new(x, y));
         });
     }
 
@@ -285,6 +256,7 @@ fn main() {
     }
 
     let _tray_guard = tray_support::setup(&home, &overlay);
+    let _topmost_guard = topmost::setup(&overlay);
 
     let audio_loop_timer = Timer::default();
     {
@@ -362,7 +334,13 @@ fn open_path(
 
     if is_video_ext(&ext) {
         #[cfg(feature = "video")]
-        match video::VideoStream::open(path) {
+        let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| video::VideoStream::open(path)))
+            .unwrap_or_else(|_| {
+                eprintln!("Probing video panicked for {path:?}");
+                None
+            });
+        #[cfg(feature = "video")]
+        match opened {
             Some(stream) => {
                 if let Some(overlay) = overlay_weak.upgrade() {
                     overlay.set_current_image(SlintImage::default());
@@ -517,27 +495,42 @@ fn start_video_timer(
         _ => return,
     };
 
-    timer.start(TimerMode::Repeated, delay, move || loop {
-        let msg = match &*playback.borrow() {
-            Playback::Video(stream) => stream.rx.try_recv().ok(),
-            _ => None,
+    timer.start(TimerMode::Repeated, delay, move || {
+        let msg = loop {
+            let received = match &*playback.borrow() {
+                Playback::Video(stream) => stream.rx.try_recv().ok(),
+                _ => None,
+            };
+            match received {
+                Some(video::VideoMsg::LoopPoint) => {
+                    audio.borrow_mut().restart();
+                    continue;
+                }
+                other => break other,
+            }
         };
 
-        match msg {
-            Some(video::VideoMsg::LoopPoint) => {
-                audio.borrow_mut().restart();
-                continue;
-            }
-            Some(video::VideoMsg::Frame { width, height, data }) => {
-                if let Some(overlay) = overlay_weak.upgrade() {
-                    let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(width, height);
-                    buffer.make_mut_bytes().copy_from_slice(&data);
-                    overlay.set_current_image(SlintImage::from_rgba8(buffer));
-                    overlay.set_has_image(true);
-                }
-                break;
-            }
-            None => break,
+        let Some(video::VideoMsg::Frame { width, height, data }) = msg else { return };
+
+        let expected_len = width as usize * height as usize * 4;
+        if data.len() != expected_len {
+            eprintln!(
+                "Dropping malformed video frame ({} bytes, expected {expected_len})",
+                data.len()
+            );
+            return;
+        }
+        let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let Some(overlay) = overlay_weak.upgrade() else { return };
+            let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(width, height);
+            buffer.make_mut_bytes().copy_from_slice(&data);
+            overlay.set_current_image(SlintImage::from_rgba8(buffer));
+            overlay.set_has_image(true);
+        }));
+
+        if applied.is_err() {
+            eprintln!("Video frame update panicked; stopping playback for this clip.");
+            *playback.borrow_mut() = Playback::Idle;
         }
     });
 }
@@ -593,24 +586,36 @@ mod audio {
                 return false;
             }
 
-            let Ok(file) = std::fs::File::open(path) else { return false };
-            let Ok(decoder) = rodio::Decoder::new(std::io::BufReader::new(file)) else {
-                return false;
-            };
+            let path_buf = path.to_path_buf();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let file = std::fs::File::open(&path_buf).ok()?;
+                let decoder = rodio::Decoder::new(std::io::BufReader::new(file)).ok()?;
 
-            let channels = decoder.channels();
-            let rate = decoder.sample_rate();
-            if channels == 0 || rate == 0 {
-                return false;
+                let channels = decoder.channels();
+                let rate = decoder.sample_rate();
+                if channels == 0 || rate == 0 {
+                    return None;
+                }
+
+                let samples: Vec<i16> = decoder.take(MAX_SAMPLES).collect();
+                if samples.is_empty() {
+                    return None;
+                }
+
+                Some(Track { channels, rate, samples })
+            }));
+
+            match result {
+                Ok(Some(track)) => {
+                    self.track = Some(track);
+                    true
+                }
+                Ok(None) => false,
+                Err(_) => {
+                    eprintln!("Audio decoding panicked for {path_buf:?}; continuing without audio.");
+                    false
+                }
             }
-
-            let samples: Vec<i16> = decoder.take(MAX_SAMPLES).collect();
-            if samples.is_empty() {
-                return false;
-            }
-
-            self.track = Some(Track { channels, rate, samples });
-            true
         }
 
         pub fn play(&mut self, looping: bool) {
@@ -802,6 +807,12 @@ mod video {
         }
     }
 
+    enum DecodeOutcome {
+        Eof { produced: bool },
+        Cancelled,
+        ReceiverGone,
+    }
+
     fn decode_once(
         path: &Path,
         width: u32,
@@ -811,7 +822,7 @@ mod video {
     ) -> bool {
         let scale = format!("scale={width}:{height}");
         let Ok(mut child) = command("ffmpeg")
-            .args(["-v", "error", "-nostdin", "-i"])
+            .args(["-v", "error", "-nostdin", "-noautorotate", "-i"])
             .arg(path)
             .args(["-an", "-vf", &scale, "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
             .stdout(Stdio::piped())
@@ -829,30 +840,37 @@ mod video {
         };
 
         let frame_bytes = width as usize * height as usize * 4;
-        let mut reader = BufReader::new(stdout);
-        let mut buffer = vec![0u8; frame_bytes];
-        let mut produced = false;
 
-        loop {
-            if cancel.load(Ordering::Relaxed) {
-                let _ = child.kill();
-                let _ = child.wait();
-                return false;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut reader = BufReader::new(stdout);
+            let mut buffer = vec![0u8; frame_bytes];
+            let mut produced = false;
+
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    return DecodeOutcome::Cancelled;
+                }
+                if reader.read_exact(&mut buffer).is_err() {
+                    return DecodeOutcome::Eof { produced };
+                }
+                produced = true;
+                if tx.send(VideoMsg::Frame { width, height, data: buffer.clone() }).is_err() {
+                    return DecodeOutcome::ReceiverGone;
+                }
             }
-            if reader.read_exact(&mut buffer).is_err() {
-                break;
-            }
-            produced = true;
-            if tx.send(VideoMsg::Frame { width, height, data: buffer.clone() }).is_err() {
-                let _ = child.kill();
-                let _ = child.wait();
-                return false;
-            }
-        }
+        }));
 
         let _ = child.kill();
         let _ = child.wait();
-        produced
+
+        match outcome {
+            Ok(DecodeOutcome::Eof { produced }) => produced,
+            Ok(DecodeOutcome::Cancelled) | Ok(DecodeOutcome::ReceiverGone) => false,
+            Err(_) => {
+                eprintln!("Video decode loop panicked while reading {path:?}");
+                false
+            }
+        }
     }
 
     fn target_size(width: u32, height: u32) -> (u32, u32) {
@@ -957,5 +975,116 @@ mod tray_support {
             _tray_icon: tray_icon,
             _poll_timer: poll_timer,
         }
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod topmost {
+    use super::OverlayWindow;
+    use i_slint_backend_winit::WinitWindowAccessor;
+    use slint::{ComponentHandle, Timer, TimerMode};
+    use std::time::Duration;
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    };
+
+    pub struct TopmostGuard {
+        _timer: Timer,
+    }
+
+    pub fn setup(overlay: &OverlayWindow) -> TopmostGuard {
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+        let raw_hwnd: isize = overlay
+            .window()
+            .with_winit_window(|winit_window| {
+                winit_window.window_handle().ok().and_then(|handle| match handle.as_raw() {
+                    RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
+                    _ => None,
+                })
+            })
+            .flatten()
+            .unwrap_or(0);
+
+        let overlay_weak = overlay.as_weak();
+        let timer = Timer::default();
+        timer.start(TimerMode::Repeated, Duration::from_millis(1500), move || {
+            let Some(overlay) = overlay_weak.upgrade() else { return };
+            if raw_hwnd == 0 || !overlay.window().is_visible() {
+                return;
+            }
+            let hwnd: HWND = raw_hwnd as HWND;
+            unsafe {
+                SetWindowPos(
+                    hwnd,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        });
+
+        TopmostGuard { _timer: timer }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+mod topmost {
+    use super::OverlayWindow;
+
+    pub struct TopmostGuard;
+
+    pub fn setup(_overlay: &OverlayWindow) -> TopmostGuard {
+        TopmostGuard
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod screen_snap {
+    use super::OverlayWindow;
+    use i_slint_backend_winit::WinitWindowAccessor;
+    use slint::ComponentHandle;
+    const SNAP_MARGIN_LOGICAL: f32 = 18.0;
+    pub fn snap(overlay: &OverlayWindow, x: i32, y: i32, width: u32, height: u32, scale: f32) -> (i32, i32) {
+        let Some(Some((mon_x, mon_y, mon_w, mon_h))) = overlay.window().with_winit_window(|winit_window| {
+            let monitor = winit_window.current_monitor()?;
+            let pos = monitor.position();
+            let size = monitor.size();
+            Some((pos.x, pos.y, size.width as i32, size.height as i32))
+        }) else {
+            return (x, y);
+        };
+
+        let margin = (SNAP_MARGIN_LOGICAL * scale).round() as i32;
+        let (w, h) = (width as i32, height as i32);
+
+        let mut nx = x;
+        if (x - mon_x).abs() <= margin {
+            nx = mon_x;
+        } else if ((x + w) - (mon_x + mon_w)).abs() <= margin {
+            nx = mon_x + mon_w - w;
+        }
+
+        let mut ny = y;
+        if (y - mon_y).abs() <= margin {
+            ny = mon_y;
+        } else if ((y + h) - (mon_y + mon_h)).abs() <= margin {
+            ny = mon_y + mon_h - h;
+        }
+
+        (nx, ny)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+mod screen_snap {
+    use super::OverlayWindow;
+
+    pub fn snap(_overlay: &OverlayWindow, x: i32, y: i32, _width: u32, _height: u32, _scale: f32) -> (i32, i32) {
+        (x, y)
     }
 }
