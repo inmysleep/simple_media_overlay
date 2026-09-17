@@ -1,0 +1,242 @@
+import { Button, LineEdit } from "std-widgets.slint";
+
+export component OverlayWindow inherits Window {
+    title: "Simple Media Overlay";
+    no-frame: true;
+    always-on-top: true;
+    background: transparent;
+
+    preferred-width: 400px;
+    preferred-height: 300px;
+    min-width: 80px;
+    min-height: 60px;
+
+    in-out property <image> current-image;
+    in-out property <bool> has-image: false;
+    // Shown on the backdrop when there is sound but no picture (audio-only files).
+    in-out property <string> caption: "";
+
+    callback close-requested();
+    callback drag-window(float, float);
+    callback drag-window-end();
+    callback resize-window(float, float);
+    callback resize-window-end();
+
+    Image {
+        source: current-image;
+        image-fit: contain;
+        width: 100%;
+        height: 100%;
+    }
+
+    backdrop := Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #202020cc;
+        border-width: 2px;
+        border-color: #ffffff40;
+        visible: !has-image;
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 6px;
+
+            Text {
+                text: root.caption == "" ? "-" : "♪";
+                font-size: 28px;
+                horizontal-alignment: center;
+            }
+            Text {
+                text: root.caption == "" ? "Nothing loaded" : root.caption;
+                color: #ffffffcc;
+                font-size: 13px;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+                width: 85%;
+            }
+            Text {
+                text: "Open a file from the Home window. Drag to move, drag the corner to resize.";
+                color: #ffffff88;
+                font-size: 10px;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+                width: 80%;
+            }
+        }
+    }
+
+    drag-area := TouchArea {
+        width: 100%;
+        height: 100%;
+        moved => {
+            if (self.pressed) {
+                root.drag-window(
+                    (self.mouse-x - self.pressed-x) / 1px,
+                    (self.mouse-y - self.pressed-y) / 1px,
+                );
+            }
+        }
+        changed pressed => {
+            if (!self.pressed) {
+                root.drag-window-end();
+            }
+        }
+    }
+
+    close-button := Rectangle {
+        x: root.width - self.width - 4px;
+        y: 4px;
+        width: 20px;
+        height: 20px;
+        background: #000000aa;
+        opacity: drag-area.has-hover ? 1.0 : 0.0;
+        animate opacity { duration: 150ms; }
+
+        Text {
+            text: "x";
+            color: white;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            width: 100%;
+            height: 100%;
+        }
+
+        close-touch := TouchArea {
+            clicked => { root.close-requested(); }
+        }
+    }
+
+    resize-handle := Rectangle {
+        x: root.width - self.width;
+        y: root.height - self.height;
+        width: 18px;
+        height: 18px;
+        background: #ffffff88;
+        opacity: drag-area.has-hover ? 1.0 : 0.0;
+        animate opacity { duration: 150ms; }
+
+        resize-area := TouchArea {
+            width: 100%;
+            height: 100%;
+            mouse-cursor: nwse-resize;
+            moved => {
+                if (self.pressed) {
+                    root.resize-window(
+                        (self.mouse-x - self.pressed-x) / 1px,
+                        (self.mouse-y - self.pressed-y) / 1px,
+                    );
+                }
+            }
+            changed pressed => {
+                if (!self.pressed) {
+                    root.resize-window-end();
+                }
+            }
+        }
+    }
+}
+
+export component HomeWindow inherits Window {
+    title: "Simple Media Overlay";
+    preferred-width: 300px;
+    preferred-height: 210px;
+    min-width: 260px;
+    min-height: 190px;
+
+    in-out property <image> icon-image;
+    icon: icon-image;
+
+    in-out property <string> width-text: "400";
+    in-out property <string> height-text: "300";
+    in-out property <string> status-text: "Nothing loaded";
+
+    // Audio state, driven from Rust.
+    in-out property <bool> has-audio: false;
+    in-out property <bool> muted: false;
+
+    callback open-file();
+    callback pick-icon();
+    callback set-size(string, string);
+    callback toggle-mute();
+    callback hide-to-tray();
+    callback quit-app();
+
+    VerticalLayout {
+        padding: 10px;
+        spacing: 8px;
+
+        Text {
+            text: root.status-text;
+            font-size: 11px;
+            color: #444444;
+            wrap: word-wrap;
+        }
+
+        HorizontalLayout {
+            spacing: 6px;
+            Button {
+                text: "Open Media";
+                clicked => { root.open-file(); }
+            }
+            Button {
+                text: "Icon";
+                clicked => { root.pick-icon(); }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 6px;
+            alignment: start;
+
+            width-input := LineEdit {
+                width: 55px;
+                text <=> root.width-text;
+                accepted => { root.set-size(width-input.text, height-input.text); }
+            }
+            Text {
+                text: "x";
+                vertical-alignment: center;
+            }
+            height-input := LineEdit {
+                width: 55px;
+                text <=> root.height-text;
+                accepted => { root.set-size(width-input.text, height-input.text); }
+            }
+            Button {
+                text: "Set";
+                clicked => { root.set-size(width-input.text, height-input.text); }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 6px;
+            alignment: start;
+
+            Button {
+                text: root.muted ? "Unmute" : "Mute";
+                enabled: root.has-audio;
+                clicked => { root.toggle-mute(); }
+            }
+            Text {
+                text: root.has-audio
+                    ? (root.muted ? "Audio muted" : "Audio playing")
+                    : "No audio track";
+                font-size: 10px;
+                color: #777777;
+                vertical-alignment: center;
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 6px;
+            Button {
+                text: "Hide to Tray";
+                clicked => { root.hide-to-tray(); }
+            }
+            Button {
+                text: "Quit";
+                clicked => { root.quit-app(); }
+            }
+        }
+    }
+}
